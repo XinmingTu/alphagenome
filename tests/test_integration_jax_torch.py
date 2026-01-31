@@ -54,6 +54,32 @@ SEQ_LEN_16KB = 16384
 if os.environ.get("ALPHAGENOME_JAX_COMPUTE_DTYPE", "float32").lower() in ("bf16", "bfloat16"):
     SEQ_LEN_16KB = 4096
 
+# Track heads to compare for prediction parity (mirrors JAX reference heads).
+TRACK_HEAD_SPECS = {
+    "rna_seq": (1, 128),
+    "cage": (1, 128),
+    "dnase": (1, 128),
+    "procap": (1, 128),
+    "atac": (1, 128),
+    "chip_tf": (128,),
+    "chip_histone": (128,),
+}
+
+SPLICE_HEAD_OUTPUTS = {
+    "splice_sites_classification": "logits",
+    "splice_sites_usage": "predictions",
+}
+
+TRACK_OUTPUT_KEYS = tuple(
+    f"{head}_scaled_predictions_{resolution}bp"
+    for head, resolutions in TRACK_HEAD_SPECS.items()
+    for resolution in resolutions
+) + tuple(
+    f"{head}_{output_key}" for head, output_key in SPLICE_HEAD_OUTPUTS.items()
+) + (
+    "contact_maps_predictions",
+)
+
 
 def get_best_gpu_index() -> int:
     """Get the GPU index with most available memory.
@@ -61,6 +87,12 @@ def get_best_gpu_index() -> int:
     Returns:
         GPU index with most free memory, or 0 if detection fails.
     """
+    forced = os.environ.get("ALPHAGENOME_GPU_INDEX")
+    if forced is not None:
+        try:
+            return int(forced)
+        except ValueError:
+            print(f"Invalid ALPHAGENOME_GPU_INDEX={forced}, falling back to auto-detect")
     try:
         import subprocess
         result = subprocess.run(
@@ -88,6 +120,15 @@ def get_best_gpu_index() -> int:
 
 # Auto-select best GPU at module load time
 _BEST_GPU = get_best_gpu_index()
+
+
+def get_torch_device() -> torch.device:
+    """Select a PyTorch device, respecting visible CUDA devices."""
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    count = torch.cuda.device_count()
+    idx = _BEST_GPU if _BEST_GPU < count else 0
+    return torch.device(f"cuda:{idx}")
 
 
 @pytest.fixture(scope="module")
@@ -219,7 +260,7 @@ def torch_model(converted_state_dict):
 
     # Move to best available GPU
     if torch.cuda.is_available():
-        device = torch.device(f"cuda:{_BEST_GPU}")
+        device = get_torch_device()
         try:
             model = model.to(device)
             print(f"PyTorch using GPU device: {device}")
@@ -250,7 +291,7 @@ def torch_model_with_reference_heads(converted_state_dict):
 
     # Move to best available GPU
     if torch.cuda.is_available():
-        device = torch.device(f"cuda:{_BEST_GPU}")
+        device = get_torch_device()
         try:
             model = model.to(device)
             print(f"PyTorch (heads) using GPU device: {device}")
@@ -583,12 +624,20 @@ def jax_torch_track_outputs_16kb(jax_model, jax_heads_apply_fn, torch_model_with
         organism_jax,
     )
 
-    # Select a subset of heads to keep runtime/memory reasonable
-    jax_outputs = {
-        'rna_seq_scaled_1bp': np.asarray(jax_preds['rna_seq']['scaled_predictions_1bp']),
-        'rna_seq_scaled_128bp': np.asarray(jax_preds['rna_seq']['scaled_predictions_128bp']),
-        'contact_maps': np.asarray(jax_preds['contact_maps']['predictions']),
-    }
+    # Collect genome track heads (scaled predictions)
+    jax_outputs = {}
+    for head_name, resolutions in TRACK_HEAD_SPECS.items():
+        head_preds = jax_preds[head_name]
+        for resolution in resolutions:
+            key = f"{head_name}_scaled_predictions_{resolution}bp"
+            jax_outputs[key] = np.asarray(head_preds[f"scaled_predictions_{resolution}bp"])
+
+    # Splice heads
+    for head_name, output_key in SPLICE_HEAD_OUTPUTS.items():
+        jax_outputs[f"{head_name}_{output_key}"] = np.asarray(jax_preds[head_name][output_key])
+
+    # Contact maps
+    jax_outputs["contact_maps_predictions"] = np.asarray(jax_preds["contact_maps"]["predictions"])
 
     # PyTorch forward pass
     device = next(torch_model_with_reference_heads.parameters()).device
@@ -600,11 +649,17 @@ def jax_torch_track_outputs_16kb(jax_model, jax_heads_apply_fn, torch_model_with
         torch_out = torch_model_with_reference_heads(seq_torch, organism_torch)
 
     torch_heads = torch_out["human"]
-    torch_outputs = {
-        'rna_seq_scaled_1bp': torch_heads['rna_seq']['scaled_predictions_1bp'].cpu().numpy(),
-        'rna_seq_scaled_128bp': torch_heads['rna_seq']['scaled_predictions_128bp'].cpu().numpy(),
-        'contact_maps': torch_heads['contact_maps'].cpu().numpy(),
-    }
+    torch_outputs = {}
+    for head_name, resolutions in TRACK_HEAD_SPECS.items():
+        head_preds = torch_heads[head_name]
+        for resolution in resolutions:
+            key = f"{head_name}_scaled_predictions_{resolution}bp"
+            torch_outputs[key] = head_preds[f"scaled_predictions_{resolution}bp"].cpu().numpy()
+
+    for head_name, output_key in SPLICE_HEAD_OUTPUTS.items():
+        torch_outputs[f"{head_name}_{output_key}"] = torch_heads[head_name].cpu().numpy()
+
+    torch_outputs["contact_maps_predictions"] = torch_heads["contact_maps"].cpu().numpy()
 
     return jax_outputs, torch_outputs
 
@@ -715,50 +770,26 @@ class TestTrackPredictionsLevel2:
             assert jax_outputs[name].shape == torch_outputs[name].shape, \
                 f"Shape mismatch for {name}: JAX={jax_outputs[name].shape}, PyTorch={torch_outputs[name].shape}"
 
-    def test_rna_seq_scaled_1bp_within_tolerance(self, jax_torch_track_outputs_16kb):
+    @pytest.mark.parametrize("output_name", TRACK_OUTPUT_KEYS)
+    def test_track_output_within_tolerance(self, jax_torch_track_outputs_16kb, output_name):
         jax_outputs, torch_outputs = jax_torch_track_outputs_16kb
 
-        jax_arr = jax_outputs['rna_seq_scaled_1bp'].flatten().astype(np.float64)
-        torch_arr = torch_outputs['rna_seq_scaled_1bp'].flatten().astype(np.float64)
+        assert check_no_nan_inf(jax_outputs[output_name]), \
+            f"JAX {output_name} contains NaN or Inf values"
+        assert check_no_nan_inf(torch_outputs[output_name]), \
+            f"PyTorch {output_name} contains NaN or Inf values"
+
+        jax_arr = jax_outputs[output_name].flatten().astype(np.float64)
+        torch_arr = torch_outputs[output_name].flatten().astype(np.float64)
 
         atol, rtol, fraction_required = get_loose_tolerance()
         within_tolerance = np.abs(jax_arr - torch_arr) <= (atol + rtol * np.abs(jax_arr))
         fraction_within = np.mean(within_tolerance)
 
-        print(f"\nrna_seq_scaled_1bp: {fraction_within*100:.2f}% within tolerance (atol={atol}, rtol={rtol})")
+        print(f"\n{output_name}: {fraction_within*100:.2f}% within tolerance (atol={atol}, rtol={rtol})")
 
         assert fraction_within >= fraction_required, \
-            f"rna_seq_scaled_1bp: only {fraction_within*100:.2f}% within tolerance, expected >= {fraction_required*100:.2f}%"
-
-    def test_rna_seq_scaled_128bp_within_tolerance(self, jax_torch_track_outputs_16kb):
-        jax_outputs, torch_outputs = jax_torch_track_outputs_16kb
-
-        jax_arr = jax_outputs['rna_seq_scaled_128bp'].flatten().astype(np.float64)
-        torch_arr = torch_outputs['rna_seq_scaled_128bp'].flatten().astype(np.float64)
-
-        atol, rtol, fraction_required = get_loose_tolerance()
-        within_tolerance = np.abs(jax_arr - torch_arr) <= (atol + rtol * np.abs(jax_arr))
-        fraction_within = np.mean(within_tolerance)
-
-        print(f"\nrna_seq_scaled_128bp: {fraction_within*100:.2f}% within tolerance (atol={atol}, rtol={rtol})")
-
-        assert fraction_within >= fraction_required, \
-            f"rna_seq_scaled_128bp: only {fraction_within*100:.2f}% within tolerance, expected >= {fraction_required*100:.2f}%"
-
-    def test_contact_maps_within_tolerance(self, jax_torch_track_outputs_16kb):
-        jax_outputs, torch_outputs = jax_torch_track_outputs_16kb
-
-        jax_arr = jax_outputs['contact_maps'].flatten().astype(np.float64)
-        torch_arr = torch_outputs['contact_maps'].flatten().astype(np.float64)
-
-        atol, rtol, fraction_required = get_loose_tolerance()
-        within_tolerance = np.abs(jax_arr - torch_arr) <= (atol + rtol * np.abs(jax_arr))
-        fraction_within = np.mean(within_tolerance)
-
-        print(f"\ncontact_maps: {fraction_within*100:.2f}% within tolerance (atol={atol}, rtol={rtol})")
-
-        assert fraction_within >= fraction_required, \
-            f"contact_maps: only {fraction_within*100:.2f}% within tolerance, expected >= {fraction_required*100:.2f}%"
+            f"{output_name}: only {fraction_within*100:.2f}% within tolerance, expected >= {fraction_required*100:.2f}%"
 
 
 # =============================================================================
