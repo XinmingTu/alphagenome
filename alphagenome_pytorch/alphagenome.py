@@ -20,6 +20,26 @@ from einops import rearrange, repeat, reduce, einsum
 from torch_einops_utils import pack_with_inverse
 from PoPE_pytorch import PoPE, compute_attn_similarity
 
+try:
+    from flash_attn import flash_attn_func as _flash_attn_func
+except Exception:
+    try:
+        from flash_attn.flash_attn_interface import flash_attn_func as _flash_attn_func
+    except Exception:
+        _flash_attn_func = None
+
+_FLASH_ATTN_SUPPORTS = {}
+if _flash_attn_func is not None:
+    _flash_attn_params = inspect.signature(_flash_attn_func).parameters
+    _FLASH_ATTN_SUPPORTS = {
+        "dropout_p": "dropout_p" in _flash_attn_params,
+        "dropout": "dropout" in _flash_attn_params,
+        "softmax_scale": "softmax_scale" in _flash_attn_params,
+        "causal": "causal" in _flash_attn_params,
+        "attn_bias": "attn_bias" in _flash_attn_params,
+        "softcap": "softcap" in _flash_attn_params,
+    }
+
 # Match JAX full-float matmul behavior (avoid TF32 on Ampere+ GPUs).
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -102,6 +122,9 @@ jax_splice_junction_max_tissues = 367
 
 def exists(v):
     return v is not None
+
+def flash_attn_available():
+    return _flash_attn_func is not None
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -346,7 +369,7 @@ class BatchRMSNorm(Module):
 
                 batch_var = get_maybe_dist_var(to_reduce, distributed = self.distributed)
 
-                running_var.lerp_(batch_var, self.momentum)
+                running_var.lerp_(batch_var.to(running_var.dtype), self.momentum)
 
         # get denominator
 
@@ -663,7 +686,8 @@ class Attention(Module):
         dim_pairwise = None,
         softclamp_value = 5., # they employ attention softclamping
         use_qk_rmsnorm = False,  # official uses LayerNorm for q/k/v norms
-        attn_bias_use_batch_rmsnorm = True
+        attn_bias_use_batch_rmsnorm = True,
+        use_flash_attn = False
     ):
         super().__init__()
         dim_pairwise = default(dim_pairwise, dim)
@@ -676,6 +700,13 @@ class Attention(Module):
 
         assert divisible_by(heads, kv_heads)
         groups = heads // kv_heads
+
+        self.heads = heads
+        self.kv_heads = kv_heads
+        self.groups = groups
+        self.use_flash_attn = use_flash_attn
+        self.last_attn_used_flash = False
+        self._flash_attn_failed = False
 
         self.split_q_heads = Rearrange('b n (g h d) -> b g h n d', h = kv_heads, g = groups)
         self.split_kv_heads = Rearrange('b n (h d) -> b h n d', h = kv_heads)
@@ -707,6 +738,77 @@ class Attention(Module):
         self.qkv_dim_splits = qkv_proj_dim_out
         self.softclamp_value = softclamp_value
 
+    def _maybe_flash_attn(
+        self,
+        q,
+        k,
+        v,
+        pairwise
+    ):
+        self.last_attn_used_flash = False
+
+        if not self.use_flash_attn or _flash_attn_func is None or self._flash_attn_failed:
+            return None
+        if not q.is_cuda:
+            return None
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return None
+
+        attn_bias = None
+        softcap = None
+
+        if exists(pairwise):
+            if not (_FLASH_ATTN_SUPPORTS.get("attn_bias") and _FLASH_ATTN_SUPPORTS.get("softcap")):
+                return None
+
+            attn_bias = self.to_attn_bias(pairwise)
+
+            assert divisible_by(q.shape[-2], attn_bias.shape[-1])
+            expand_factor = q.shape[-2] // attn_bias.shape[-1]
+
+            attn_bias = repeat(
+                attn_bias,
+                'b g h i j -> b g h (i r1) (j r2)',
+                r1 = expand_factor,
+                r2 = expand_factor
+            )
+
+            attn_bias = rearrange(attn_bias, 'b g h i j -> b (g h) i j')
+            attn_bias = attn_bias.to(dtype = q.dtype).contiguous()
+            softcap = self.softclamp_value
+
+        q_flash = rearrange(q, 'b g h n d -> b n (g h) d').contiguous()
+        k_flash = rearrange(k, 'b h n d -> b n h d').contiguous()
+        v_flash = rearrange(v, 'b h n d -> b n h d').contiguous()
+
+        if self.groups > 1:
+            k_flash = repeat(k_flash, 'b n h d -> b n (g h) d', g = self.groups).contiguous()
+            v_flash = repeat(v_flash, 'b n h d -> b n (g h) d', g = self.groups).contiguous()
+
+        flash_kwargs = {}
+        if _FLASH_ATTN_SUPPORTS.get("dropout_p"):
+            flash_kwargs["dropout_p"] = 0.0
+        elif _FLASH_ATTN_SUPPORTS.get("dropout"):
+            flash_kwargs["dropout"] = 0.0
+        if _FLASH_ATTN_SUPPORTS.get("softmax_scale"):
+            flash_kwargs["softmax_scale"] = self.scale
+        if _FLASH_ATTN_SUPPORTS.get("causal"):
+            flash_kwargs["causal"] = False
+        if attn_bias is not None:
+            flash_kwargs["attn_bias"] = attn_bias
+        if softcap is not None:
+            flash_kwargs["softcap"] = softcap
+
+        try:
+            out = _flash_attn_func(q_flash, k_flash, v_flash, **flash_kwargs)
+        except Exception:
+            self._flash_attn_failed = True
+            return None
+
+        out = rearrange(out, 'b n (g h) d -> b g h n d', g = self.groups, h = self.kv_heads)
+        self.last_attn_used_flash = True
+        return out
+
     def forward(
         self,
         x,
@@ -716,6 +818,7 @@ class Attention(Module):
     ):
 
         use_bf16 = _ALLOW_NATIVE_BF16 and x.is_cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+        self.last_attn_used_flash = False
 
         if use_bf16:
             x_qkv = x.to(torch.bfloat16)
@@ -743,6 +846,19 @@ class Attention(Module):
             rotary_dtype = q.dtype if use_bf16 else rotary_emb.dtype
             rotary = rotary_emb.to(rotary_dtype) if rotary_emb.dtype != rotary_dtype else rotary_emb
             q, k = tuple(apply_rotary_pos_emb(rotary, t) for t in (q, k))
+
+        def project_out(out):
+            out = self.merge_heads(out)
+            if use_bf16:
+                weight = self.to_out.weight.to(out.dtype)
+                bias = self.to_out.bias.to(out.dtype) if exists(self.to_out.bias) else None
+                return F.linear(out, weight, bias)
+            return self.to_out(out)
+
+        if not exists(polar_emb):
+            flash_out = self._maybe_flash_attn(q, k, v, pairwise)
+            if flash_out is not None:
+                return project_out(flash_out)
 
         # similarities
 
@@ -787,14 +903,7 @@ class Attention(Module):
         else:
             out = einsum(attn, v, 'b g h i j, b h j d -> b g h i d')
 
-        out = self.merge_heads(out)
-
-        if use_bf16:
-            weight = self.to_out.weight.to(out.dtype)
-            bias = self.to_out.bias.to(out.dtype) if exists(self.to_out.bias) else None
-            return F.linear(out, weight, bias)
-
-        return self.to_out(out)
+        return project_out(out)
 
 # single to pairwise
 
@@ -885,24 +994,88 @@ class SingleToPairwise(Module):
 class PairwiseRowAttention(Module):
     def __init__(
         self,
-        dim
+        dim,
+        use_flash_attn = False
     ):
         super().__init__()
         self.scale = dim ** -0.5
 
         self.to_qk = LinearNoBias(dim, dim * 2)
         self.to_v = Linear(dim, dim)
+        self.use_flash_attn = use_flash_attn
+        self.last_attn_used_flash = False
+        self._flash_attn_failed = False
+
+    def _maybe_flash_attn(
+        self,
+        q,
+        k,
+        v
+    ):
+        self.last_attn_used_flash = False
+
+        if not self.use_flash_attn or _flash_attn_func is None or self._flash_attn_failed:
+            return None
+        if not q.is_cuda:
+            return None
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return None
+
+        b, rows, cols, d = q.shape
+
+        q_flash = rearrange(q, 'b r c d -> (b r) c 1 d').contiguous()
+        k_flash = rearrange(k, 'b r c d -> (b r) c 1 d').contiguous()
+        v_flash = rearrange(v, 'b r c d -> (b r) c 1 d').contiguous()
+
+        flash_kwargs = {}
+        if _FLASH_ATTN_SUPPORTS.get("dropout_p"):
+            flash_kwargs["dropout_p"] = 0.0
+        elif _FLASH_ATTN_SUPPORTS.get("dropout"):
+            flash_kwargs["dropout"] = 0.0
+        if _FLASH_ATTN_SUPPORTS.get("softmax_scale"):
+            flash_kwargs["softmax_scale"] = self.scale
+        if _FLASH_ATTN_SUPPORTS.get("causal"):
+            flash_kwargs["causal"] = False
+        if _FLASH_ATTN_SUPPORTS.get("softcap"):
+            flash_kwargs["softcap"] = 0.0
+
+        try:
+            out = _flash_attn_func(q_flash, k_flash, v_flash, **flash_kwargs)
+        except Exception:
+            self._flash_attn_failed = True
+            return None
+
+        out = rearrange(out, '(b r) c 1 d -> b r c d', b = b, r = rows)
+        self.last_attn_used_flash = True
+        return out
 
     def forward(
         self,
         x
     ):
 
-        q, k = self.to_qk(x).chunk(2, dim = -1)
-        v = self.to_v(x)
+        use_bf16 = _ALLOW_NATIVE_BF16 and x.is_cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
+
+        if use_bf16:
+            x_qkv = x.to(torch.bfloat16)
+            qk = F.linear(x_qkv, self.to_qk.weight.to(torch.bfloat16))
+            v = F.linear(
+                x_qkv,
+                self.to_v.weight.to(torch.bfloat16),
+                self.to_v.bias.to(torch.bfloat16) if exists(self.to_v.bias) else None
+            )
+        else:
+            qk = self.to_qk(x)
+            v = self.to_v(x)
+
+        q, k = qk.chunk(2, dim = -1)
         q = maybe_bf16(q)
         k = maybe_bf16(k)
         v = maybe_bf16(v)
+
+        flash_out = self._maybe_flash_attn(q, k, v)
+        if flash_out is not None:
+            return flash_out
 
         # similarity
 
@@ -953,6 +1126,7 @@ class TransformerTower(Module):
         pairwise_every_num_single_blocks = 2,   # how often to do a pairwise block
         single_to_pairwise_heads = 32,          # they did 32
         pool_size = 16,
+        use_flash_attn = False,
         attn_kwargs: dict = dict(),
         ff_kwargs: dict = dict()
     ):
@@ -978,7 +1152,14 @@ class TransformerTower(Module):
 
         for layer_index in range(depth):
 
-            attn = Attention(dim = dim, dim_head_qk = dim_head_qk, dim_head_v = dim_head_v, heads = heads, dim_pairwise = dim_pairwise)
+            attn = Attention(
+                dim = dim,
+                dim_head_qk = dim_head_qk,
+                dim_head_v = dim_head_v,
+                heads = heads,
+                dim_pairwise = dim_pairwise,
+                use_flash_attn = use_flash_attn
+            )
 
             ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor)
 
@@ -997,7 +1178,7 @@ class TransformerTower(Module):
                     pool_size = pool_size,
                     rel_pos_features_dim = single_to_pairwise_heads * 2
                 )
-                pairwise_attn = PairwiseRowAttention(dim_pairwise)
+                pairwise_attn = PairwiseRowAttention(dim_pairwise, use_flash_attn = use_flash_attn)
                 pairwise_ff = FeedForward(dim = dim_pairwise, expansion_factor = ff_expansion_factor)
 
                 pairwise_attn = NormWrapper(dim = dim_pairwise, block = pairwise_attn, dropout = dropout, use_batch_rmsnorm = False)

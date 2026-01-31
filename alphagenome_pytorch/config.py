@@ -30,6 +30,7 @@ class AlphaGenomeConfig:
             "pairwise_every_num_single_blocks": 2,
             "single_to_pairwise_heads": 32,
             "pool_size": 16,
+            "use_flash_attn": False,
         }
 
         self.head_specs = head_specs or {
