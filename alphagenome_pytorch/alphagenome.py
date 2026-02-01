@@ -40,10 +40,17 @@ if _flash_attn_func is not None:
         "softcap": "softcap" in _flash_attn_params,
     }
 
-# Match JAX full-float matmul behavior (avoid TF32 on Ampere+ GPUs).
+try:
+    from torch.nn.attention import flex_attention as _flex_attention
+    _flex_attention_func = _flex_attention.flex_attention
+except Exception:
+    _flex_attention_func = None
+
+# Control TF32 for performance vs parity (off by default).
+_ALLOW_TF32 = os.environ.get("ALPHAGENOME_ALLOW_TF32", "0") == "1"
 if torch.cuda.is_available():
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = _ALLOW_TF32
+    torch.backends.cudnn.allow_tf32 = _ALLOW_TF32
 
 # Emulate JAX mixed-precision outputs by rounding activations to bf16.
 # Disabled by default; enable with ALPHAGENOME_EMULATE_BF16=1.
@@ -125,6 +132,9 @@ def exists(v):
 
 def flash_attn_available():
     return _flash_attn_func is not None
+
+def flex_attn_available():
+    return _flex_attention_func is not None
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -687,7 +697,8 @@ class Attention(Module):
         softclamp_value = 5., # they employ attention softclamping
         use_qk_rmsnorm = False,  # official uses LayerNorm for q/k/v norms
         attn_bias_use_batch_rmsnorm = True,
-        use_flash_attn = False
+        use_flash_attn = False,
+        use_flex_attn = False
     ):
         super().__init__()
         dim_pairwise = default(dim_pairwise, dim)
@@ -705,8 +716,11 @@ class Attention(Module):
         self.kv_heads = kv_heads
         self.groups = groups
         self.use_flash_attn = use_flash_attn
+        self.use_flex_attn = use_flex_attn
         self.last_attn_used_flash = False
+        self.last_attn_used_flex = False
         self._flash_attn_failed = False
+        self._flex_attn_failed = False
 
         self.split_q_heads = Rearrange('b n (g h d) -> b g h n d', h = kv_heads, g = groups)
         self.split_kv_heads = Rearrange('b n (h d) -> b h n d', h = kv_heads)
@@ -809,6 +823,75 @@ class Attention(Module):
         self.last_attn_used_flash = True
         return out
 
+    def _maybe_flex_attn(
+        self,
+        q,
+        k,
+        v,
+        pairwise
+    ):
+        self.last_attn_used_flex = False
+
+        if not self.use_flex_attn or _flex_attention_func is None or self._flex_attn_failed:
+            return None
+        if not q.is_cuda:
+            return None
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            return None
+        if not exists(pairwise):
+            return None
+
+        attn_bias = self.to_attn_bias(pairwise)
+
+        assert divisible_by(q.shape[-2], attn_bias.shape[-1])
+        expand_factor = q.shape[-2] // attn_bias.shape[-1]
+
+        # keep low-res bias and index into it in score_mod to avoid materializing full-res bias
+        attn_bias = rearrange(attn_bias, 'b g h i j -> b (g h) i j').to(dtype = q.dtype).contiguous()
+
+        q_flex = rearrange(q, 'b g h n d -> b (g h) n d').contiguous()
+        k_flex = rearrange(k, 'b h n d -> b h n d').contiguous()
+        v_flex = rearrange(v, 'b h n d -> b h n d').contiguous()
+
+        qk_dim = q_flex.shape[-1]
+        v_dim = v_flex.shape[-1]
+        target_dim = 1 << (max(qk_dim, v_dim) - 1).bit_length()
+        pad_qk = target_dim - qk_dim
+        pad_v = target_dim - v_dim
+        if pad_qk:
+            q_flex = F.pad(q_flex, (0, pad_qk))
+            k_flex = F.pad(k_flex, (0, pad_qk))
+        if pad_v:
+            v_flex = F.pad(v_flex, (0, pad_v))
+
+        softcap = self.softclamp_value
+
+        def score_mod(score, batch, head, q_idx, k_idx):
+            q_low = q_idx // expand_factor
+            k_low = k_idx // expand_factor
+            score = score + attn_bias[batch, head, q_low, k_low]
+            return softclamp(score, value = softcap)
+
+        try:
+            out = _flex_attention_func(
+                q_flex,
+                k_flex,
+                v_flex,
+                score_mod = score_mod,
+                scale = self.scale,
+                enable_gqa = True
+            )
+        except Exception:
+            self._flex_attn_failed = True
+            return None
+
+        if pad_v:
+            out = out[..., :v_dim]
+
+        out = rearrange(out, 'b (g h) n d -> b g h n d', g = self.groups, h = self.kv_heads)
+        self.last_attn_used_flex = True
+        return out
+
     def forward(
         self,
         x,
@@ -819,6 +902,7 @@ class Attention(Module):
 
         use_bf16 = _ALLOW_NATIVE_BF16 and x.is_cuda and getattr(torch.cuda, "is_bf16_supported", lambda: False)()
         self.last_attn_used_flash = False
+        self.last_attn_used_flex = False
 
         if use_bf16:
             x_qkv = x.to(torch.bfloat16)
@@ -856,6 +940,10 @@ class Attention(Module):
             return self.to_out(out)
 
         if not exists(polar_emb):
+            flex_out = self._maybe_flex_attn(q, k, v, pairwise)
+            if flex_out is not None:
+                return project_out(flex_out)
+
             flash_out = self._maybe_flash_attn(q, k, v, pairwise)
             if flash_out is not None:
                 return project_out(flash_out)
@@ -1127,6 +1215,7 @@ class TransformerTower(Module):
         single_to_pairwise_heads = 32,          # they did 32
         pool_size = 16,
         use_flash_attn = False,
+        use_flex_attn = False,
         attn_kwargs: dict = dict(),
         ff_kwargs: dict = dict()
     ):
@@ -1158,7 +1247,8 @@ class TransformerTower(Module):
                 dim_head_v = dim_head_v,
                 heads = heads,
                 dim_pairwise = dim_pairwise,
-                use_flash_attn = use_flash_attn
+                use_flash_attn = use_flash_attn,
+                use_flex_attn = use_flex_attn
             )
 
             ff = FeedForward(dim = dim, expansion_factor = ff_expansion_factor)

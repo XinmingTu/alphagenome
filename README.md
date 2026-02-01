@@ -15,6 +15,49 @@ Implementation of [AlphaGenome](https://deepmind.google/discover/blog/alphagenom
 $ pip install alphagenome-pytorch
 ```
 
+### FlashAttention2 (optional, CUDA)
+
+```bash
+# uv (recommended)
+$ uv pip install '.[flashattn]'
+```
+
+Enable in the model config:
+
+```python
+model = AlphaGenome(
+    transformer_kwargs = {
+        "use_flash_attn": True
+    }
+)
+```
+
+Notes:
+- FlashAttention2 requires CUDA and a supported build of `flash-attn`.
+- The fast path is only used when the kernel supports attention bias + softcapping, otherwise it falls back to the standard attention path.
+- For native bf16 compute, set `ALPHAGENOME_TORCH_BF16=1`.
+
+### FlexAttention (optional, PyTorch)
+
+FlexAttention can handle arbitrary attention bias via a custom score modifier, so it can be used for the main attention path when its kernel constraints are met.
+
+Enable in the model config:
+
+```python
+model = AlphaGenome(
+    transformer_kwargs = {
+        "use_flex_attn": True
+    }
+)
+```
+
+Notes:
+- Requires PyTorch with `torch.nn.attention.flex_attention` available (prototype feature).
+- Best with CUDA + bf16; set `ALPHAGENOME_TORCH_BF16=1`.
+- FlexAttention is only used when pairwise bias is present and polar embeddings are not used.
+- FlexAttention in torch 2.5 requires power-of-two head dims and `dim_head_v <= dim_head_qk`.
+  To keep the pretrained weights intact, the flex path pads q/k/v up to the next power-of-two and slices the output back to the original `dim_head_v`. This enables flex for the default model but adds overhead.
+
 ## Usage
 
 The main unet transformer, without any heads

@@ -58,6 +58,10 @@ convert = [
     "alphagenome-research @ git+https://github.com/google-deepmind/alphagenome_research.git",
 ]
 
+flashattn = [
+    "flash-attn",
+]
+
 [tool.pytest.ini_options]
 pythonpath = [
   "."
